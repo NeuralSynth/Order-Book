@@ -7,7 +7,11 @@
 //   --runs N        timed runs per invocation (default 5); medians are reported
 //   --total-only    skip the per-op pass (use under perf, see below)
 //   --latency       also print per-op latency percentiles (from the last run)
+//   --batch         replace the per-op pass with block timing + least squares, and add a
+//                   "clock-perturbed" total pass (see run_block_pass / run_perturbed_pass)
 //   --ops N --seed S  override the workload (defaults 1,000,000 / 42; graded results use the defaults)
+//   --mix graded|thin        op mix: 70/20/10 (graded) or 45/45/10 (thin book; NON-GRADED)
+//   --ids sequential|scrambled   order ids 1,2,3,... (graded) or scrambled 64-bit (NON-GRADED)
 //
 // Timing methodology (see README "Benchmark methodology"):
 //   - The whole op stream is generated before any timing. Every impl replays the same
@@ -28,12 +32,14 @@
 #include <algorithm>
 #include <chrono>
 #include <cinttypes>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "book_a.h"
@@ -199,6 +205,143 @@ PerOpResult run_per_op_pass(const std::vector<Op>& ops, std::vector<int64_t>* la
     return r;
 }
 
+// --- batched pass (--batch) ---------------------------------------------------------
+//
+// An alternative to timing every op. The stream is cut into blocks of kBlockOps
+// consecutive ops and only whole blocks are timed: one clock pair per 50 ops, so ops run
+// back-to-back as in the total pass. Per-type costs are then estimated by least squares.
+// Each block's time is modelled as
+//     t_block = n_add * c_add + n_cancel * c_cancel + n_bbo * c_bbo + n_depth * c_depth
+// and the four costs c that best fit all 20,000 blocks are solved from the 4x4 normal
+// equations. With 50-op blocks, only every other block contains a depth query (every 100th
+// op), so the depth cost can be separated from the rest.
+//
+// Two properties to know when reading the output:
+//   - Every full block has exactly 50 add/cancel/BBO ops, so the estimated costs always add
+//     up to the measured total time. That agreement is guaranteed by the method, not evidence.
+//     It also means a constant per-block error k (e.g. mis-calibrated clock overhead) shifts
+//     each of add/cancel/BBO by k/50.
+//   - R^2 = 1 - (residual variance / variance of block times) says how much of the
+//     block-to-block variation the per-type model explains. A low R^2 means block times are
+//     dominated by things the model ignores (noise, interrupts, cache state), so the
+//     per-type split is uncertain.
+
+constexpr std::size_t kBlockOps = 50;
+
+struct BlockResult {
+    bool solved;
+    double ns[kNumCategories];
+    double r_squared;
+    uint64_t checksum;
+};
+
+// Solves a * x = b for a 4x4 system by Gaussian elimination with partial pivoting.
+bool solve4(double a[4][4], double b[4], double x[4]) {
+    for (int col = 0; col < 4; ++col) {
+        int pivot = col;
+        for (int r = col + 1; r < 4; ++r) {
+            if (std::fabs(a[r][col]) > std::fabs(a[pivot][col])) pivot = r;
+        }
+        if (std::fabs(a[pivot][col]) < 1e-9) return false;  // a type never occurs: not solvable
+        std::swap(a[col], a[pivot]);
+        std::swap(b[col], b[pivot]);
+        for (int r = col + 1; r < 4; ++r) {
+            const double f = a[r][col] / a[col][col];
+            for (int c = col; c < 4; ++c) a[r][c] -= f * a[col][c];
+            b[r] -= f * b[col];
+        }
+    }
+    for (int r = 3; r >= 0; --r) {
+        double s = b[r];
+        for (int c = r + 1; c < 4; ++c) s -= a[r][c] * x[c];
+        x[r] = s / a[r][r];
+    }
+    return true;
+}
+
+template <typename Book>
+BlockResult run_block_pass(const std::vector<Op>& ops, double pair_overhead_ns) {
+    const auto book = std::make_unique<Book>();
+    Checksum cs;
+    double xtx[4][4] = {};
+    double xty[4] = {};
+    struct Block {
+        double n[kNumCategories];
+        double t;
+    };
+    std::vector<Block> blocks;  // kept to compute R^2 after solving
+    blocks.reserve(ops.size() / kBlockOps + 1);
+
+    for (std::size_t start = 0; start < ops.size(); start += kBlockOps) {
+        const std::size_t end = std::min(ops.size(), start + kBlockOps);
+
+        const Clock::time_point t0 = Clock::now();
+        for (std::size_t i = start; i < end; ++i) {
+            apply(*book, ops[i], cs);
+            if (is_depth_point(i)) depth_query(*book, cs);
+        }
+        const Clock::time_point t1 = Clock::now();
+
+        // The block's composition is counted after the clock stops.
+        double n[kNumCategories] = {};
+        for (std::size_t i = start; i < end; ++i) {
+            n[static_cast<int>(ops[i].type)] += 1;
+            if (is_depth_point(i)) n[kDepth] += 1;
+        }
+        const double t = static_cast<double>(elapsed_ns(t0, t1)) - pair_overhead_ns;
+        for (int r = 0; r < kNumCategories; ++r) {
+            xty[r] += n[r] * t;
+            for (int c = 0; c < kNumCategories; ++c) xtx[r][c] += n[r] * n[c];
+        }
+        Block b{};
+        std::copy(n, n + kNumCategories, b.n);
+        b.t = t;
+        blocks.push_back(b);
+    }
+
+    BlockResult result{};
+    result.checksum = cs.value;
+    result.solved = solve4(xtx, xty, result.ns);
+    if (result.solved) {
+        double mean_t = 0.0;
+        for (const Block& b : blocks) mean_t += b.t;
+        mean_t /= static_cast<double>(blocks.size());
+        double ss_res = 0.0;
+        double ss_tot = 0.0;
+        for (const Block& b : blocks) {
+            double predicted = 0.0;
+            for (int c = 0; c < kNumCategories; ++c) predicted += b.n[c] * result.ns[c];
+            ss_res += (b.t - predicted) * (b.t - predicted);
+            ss_tot += (b.t - mean_t) * (b.t - mean_t);
+        }
+        result.r_squared = ss_tot > 0.0 ? 1.0 - ss_res / ss_tot : 0.0;
+    }
+    return result;
+}
+
+// Same loop as the total pass, but reads the clock after every op and depth query and
+// throws the value away. Comparing it with the plain total pass shows how much reading the
+// clock between ops slows each implementation down, beyond the cost of the reads themselves.
+template <typename Book>
+int64_t run_perturbed_pass(const std::vector<Op>& ops, uint64_t expected_checksum, bool& checksum_ok) {
+    const auto book = std::make_unique<Book>();
+    Checksum cs;
+
+    const Clock::time_point start = Clock::now();
+    for (std::size_t i = 0; i < ops.size(); ++i) {
+        apply(*book, ops[i], cs);
+        (void)Clock::now();  // an opaque library call: the compiler cannot remove it
+        if (is_depth_point(i)) {
+            depth_query(*book, cs);
+            (void)Clock::now();
+        }
+    }
+    const Clock::time_point end = Clock::now();
+
+    checksum_ok &= cs.value == expected_checksum;
+    return elapsed_ns(start, end);
+}
+
 // --- reporting --------------------------------------------------------------------
 
 double median(std::vector<double> v) {
@@ -240,7 +383,13 @@ struct BenchOptions {
     int runs = 5;
     bool total_only = false;
     bool latency = false;
+    bool batch = false;
 };
+
+bool is_graded(const WorkloadSpec& spec) {
+    return spec.num_ops == kDefaultNumOps && spec.seed == kDefaultSeed && !spec.scrambled_ids &&
+           spec.mix.add_percent == kGradedMix.add_percent && spec.mix.cancel_percent == kGradedMix.cancel_percent;
+}
 
 template <typename Book>
 int run_benchmark(char impl, const WorkloadSpec& spec, const BenchOptions& opt) {
@@ -271,6 +420,13 @@ int run_benchmark(char impl, const WorkloadSpec& spec, const BenchOptions& opt) 
                 ops.size(), stats.adds, stats.cancels, stats.bbos, depth_queries, kDepthQueryLevels,
                 kDepthQueryLevels);
     std::printf("Workload: seed %" PRIu32 ", hash %016" PRIx64 "\n", spec.seed, hash_workload(ops));
+    if (!is_graded(spec)) {
+        std::printf("WARNING: NON-GRADED workload variant (ops %zu, seed %" PRIu32 ", mix %d/%d/%d, %s ids). "
+                    "Report separately from the graded numbers.\n",
+                    spec.num_ops, spec.seed, spec.mix.add_percent, spec.mix.cancel_percent,
+                    100 - spec.mix.add_percent - spec.mix.cancel_percent,
+                    spec.scrambled_ids ? "scrambled" : "sequential");
+    }
 
     ClockInfo clock{0.0, 0};
     if (!opt.total_only) {
@@ -278,7 +434,15 @@ int run_benchmark(char impl, const WorkloadSpec& spec, const BenchOptions& opt) 
         std::printf("Clock: steady_clock pair overhead %.1f ns (subtracted from per-op means), granularity %" PRId64
                     " ns\n",
                     clock.pair_overhead_ns, clock.granularity_ns);
+        if (opt.batch) {
+            std::printf("Per-op method: block least squares (%zu-op blocks); plus a clock-perturbed total pass\n",
+                        kBlockOps);
+        } else {
+            std::printf("Per-op method: clock pair around every op\n");
+        }
     }
+    std::vector<double> perturbed_ms;
+    std::vector<double> r_squared;
 
     std::vector<double> totals_ms;
     std::vector<double> per_op_ns[kNumCategories];
@@ -304,7 +468,19 @@ int run_benchmark(char impl, const WorkloadSpec& spec, const BenchOptions& opt) 
         checksum_ok &= total.checksum == checksum;
         std::printf("Run %d: total %8.2f ms", run, totals_ms.back());
 
-        if (!opt.total_only) {
+        if (!opt.total_only && opt.batch) {
+            const BlockResult block = run_block_pass<Book>(ops, clock.pair_overhead_ns);
+            checksum_ok &= block.checksum == checksum;
+            std::printf(" |");
+            for (int c = 0; c < kNumCategories; ++c) {
+                per_op_ns[c].push_back(block.solved ? block.ns[c] : 0.0);
+                std::printf(" ns/%s %7.1f", kCategoryNames[c], per_op_ns[c].back());
+            }
+            r_squared.push_back(block.solved ? block.r_squared : 0.0);
+            perturbed_ms.push_back(static_cast<double>(run_perturbed_pass<Book>(ops, checksum, checksum_ok)) / 1e6);
+            std::printf(" | R2 %.3f | perturbed %8.2f ms", r_squared.back(), perturbed_ms.back());
+            if (!block.solved) std::printf(" (least squares not solvable: an op type is missing)");
+        } else if (!opt.total_only) {
             const bool record = opt.latency && run == opt.runs;
             if (record) {
                 for (auto& v : latencies) v.clear();
@@ -339,6 +515,17 @@ int run_benchmark(char impl, const WorkloadSpec& spec, const BenchOptions& opt) 
         for (int c = 0; c < kNumCategories; ++c) std::printf("  ns/%s: %.1f", kCategoryNames[c], median(per_op_ns[c]));
         std::printf("\n");
     }
+    if (!opt.total_only && opt.batch) {
+        // Clock reads in the perturbed pass: one per op plus one per depth query.
+        const double reads = static_cast<double>(ops.size() + depth_queries);
+        const double perturbed = median(perturbed_ms);
+        const double read_cost_ms = reads * clock.pair_overhead_ns / 1e6;
+        std::printf("Median R2 of block model: %.3f\n", median(r_squared));
+        std::printf("Median perturbed total: %.2f ms = total %.2f + clock reads %.0f x %.1f ns (%.2f ms) "
+                    "+ unexplained %.2f ms\n",
+                    perturbed, median(totals_ms), reads, clock.pair_overhead_ns, read_cost_ms,
+                    perturbed - median(totals_ms) - read_cost_ms);
+    }
     if (opt.latency && !opt.total_only) print_latency_percentiles(latencies);
     print_bbo(final_bbo);
     std::printf("Checksum: %016" PRIx64 "\n", checksum);
@@ -353,7 +540,8 @@ int run_benchmark(char impl, const WorkloadSpec& spec, const BenchOptions& opt) 
 void print_usage(const char* prog) {
     std::fprintf(stderr,
                  "Usage:\n"
-                 "  %s --impl A|B|C [--runs N] [--total-only] [--latency] [--ops N] [--seed S]\n"
+                 "  %s --impl A|B|C [--runs N] [--total-only | --latency | --batch] [--ops N] [--seed S]\n"
+                 "                  [--mix graded|thin] [--ids sequential|scrambled]\n"
                  "  %s --verify [--impl ABC] [--ops N] [--seed S]\n"
                  "  %s --generate-only [--ops N] [--seed S]\n",
                  prog, prog, prog);
@@ -378,6 +566,25 @@ int main(int argc, char** argv) {
             opt.total_only = true;
         } else if (std::strcmp(argv[i], "--latency") == 0) {
             opt.latency = true;
+        } else if (std::strcmp(argv[i], "--batch") == 0) {
+            opt.batch = true;
+        } else if (std::strcmp(argv[i], "--mix") == 0 && has_value) {
+            const std::string mix = argv[++i];
+            if (mix == "graded") {
+                spec.mix = kGradedMix;
+            } else if (mix == "thin") {
+                spec.mix = kThinBookMix;
+            } else {
+                print_usage(argv[0]);
+                return 2;
+            }
+        } else if (std::strcmp(argv[i], "--ids") == 0 && has_value) {
+            const std::string ids = argv[++i];
+            if (ids != "sequential" && ids != "scrambled") {
+                print_usage(argv[0]);
+                return 2;
+            }
+            spec.scrambled_ids = ids == "scrambled";
         } else if (std::strcmp(argv[i], "--impl") == 0 && has_value) {
             impl = argv[++i];
         } else if (std::strcmp(argv[i], "--runs") == 0 && has_value) {
@@ -401,7 +608,7 @@ int main(int argc, char** argv) {
         return 0;
     }
 
-    if (opt.runs < 1 || impl.size() != 1 || spec.num_ops == 0) {
+    if (opt.runs < 1 || impl.size() != 1 || spec.num_ops == 0 || (opt.batch && (opt.latency || opt.total_only))) {
         print_usage(argv[0]);
         return 2;
     }
