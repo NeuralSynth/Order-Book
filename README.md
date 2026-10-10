@@ -167,8 +167,10 @@ TAG=scrambled BENCH_ARGS="--ids scrambled" scripts/run_bench.sh   # 5 processes 
 
 ## Report
 
-`docs/report.md`: results table and analysis (questions 11.1–11.6). Every number in it
-comes from a file in `results/`.
+`docs/report.md`: the 1.5-page report (results table and answers to 11.1–11.6).
+`docs/report_details.md`: the supporting evidence behind it (data-quality checks, profile hot
+spots, substitute experiments, workload facts, and a claim → evidence table). Every number in
+both comes from a file in `results/`.
 
 ## Implementations
 

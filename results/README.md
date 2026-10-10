@@ -1,6 +1,6 @@
 # results/
 
-Raw outputs produced on the authors' machine. Every number in `docs/report.md` traces back
+Raw outputs produced on the authors' machine. Every number in `docs/report.md` and `docs/report_details.md` traces back
 to a file here. Nothing in this folder is typed in or edited by hand.
 
 ## Layout
